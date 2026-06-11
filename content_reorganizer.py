@@ -28,7 +28,8 @@ except ImportError:
 @dataclass
 class ReorganizeConfig:
     """重构配置"""
-    max_pages_per_batch: int = 25  # 每批处理的目标页数
+    max_pages_per_batch: int = 100  # 每批处理的目标页数
+    max_chars_per_batch: int = 350000  # 每批处理的字符数上限（约对应140K-175K tokens）
     enable_reorganize: bool = True  # 是否启用重构
     preserve_page_markers: bool = False  # 是否保留页码标记
     remove_footer_patterns: List[str] = None  # 额外的页脚匹配模式
@@ -65,11 +66,18 @@ class ContentReorganizer:
 - 如果一个段落、列表项或表格在页底被截断、在下一页继续，必须合并为完整内容
 - 合并后去除分页痕迹，让内容自然衔接
 
-### 4. 构建报告结构
+### 4. 构建报告结构（极其重要）
 - 分析文档逻辑，将其组织为清晰的章节层级
-- 使用 Markdown 标题层级：`#` 文档标题、`##` 大章节、`###` 小章节、`####` 子项
-- 过渡页上的章节标题应成为对应正文部分的章节标题
-- 目录页（如有）可去除或简化为文首说明
+- 使用 Markdown 标题层级时，必须严格遵循以下规则：
+  - `# ` 只能用于**文档主标题**，且整个文档只能出现一次
+  - `## ` 用于**章节标题**（如"第1章"、"一、xxx"、"01 xxx"）
+  - `### ` 用于**小节标题**
+  - `#### ` 用于**子项标题**
+  - **严禁使用 `##### ` 或更深层级**
+- 如果原文已有章节编号（如"1. xxx"、"第1章"），请保持原有编号，不要重新编号
+- 如果过渡页上有一个章节标题，正文第一页又有该章节的详细标题，只保留一个，以正文详细标题为准
+- 严禁出现同级标题编号重复（如两个 `## 1. xxx`）
+- 章节标题统一使用 `## `，不要用 `# `
 - 保持合理的标题层级关系，不要所有标题都用同一级别
 
 ### 5. 格式规范
@@ -143,11 +151,22 @@ class ContentReorganizer:
         # 准备带页码标记的内容
         pages_content = self._prepare_pages_content(pages)
 
-        # 判断是否需要分块处理
+        # 判断是否需要分块处理（结合页数和字符数）
         total_pages = len(pages)
-        if total_pages <= config.max_pages_per_batch:
+        total_chars = sum(len(content) for _, content in pages)
+        estimated_tokens = total_chars // 2  # 保守估算：中文约2字符/token
+        SINGLE_BATCH_TOKEN_LIMIT = 180000  # 留76K给输出+prompt余量
+
+        if total_pages <= config.max_pages_per_batch and estimated_tokens <= SINGLE_BATCH_TOKEN_LIMIT:
             # 短文档：直接全文重构
-            return self._reorganize_single_batch(pages_content, doc_title)
+            try:
+                return self._reorganize_single_batch(pages_content, doc_title)
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "context_length" in error_msg or "too long" in error_msg:
+                    print(f"  ⚠️  单批输入过长（约{estimated_tokens} tokens），自动降级为分块重构...")
+                    return self._reorganize_in_batches(pages, doc_title, config)
+                raise
         else:
             # 长文档：分块重构
             return self._reorganize_in_batches(pages, doc_title, config)
@@ -212,6 +231,7 @@ class ContentReorganizer:
         batch: List[Tuple[int, str]],
         doc_title: str,
         total_batches: int,
+        previous_summary: Optional[str] = None,
         retry_count: int = 2,
     ) -> Tuple[int, str]:
         """
@@ -237,7 +257,10 @@ class ContentReorganizer:
             batch_note += (
                 "文档主标题已由前一部分提供，"
                 "请只输出本章节的结构化内容，不要重复输出 `# 文档标题`。"
+                "但请注意：**章节标题仍然必须使用 `## ` 级别**，不要降级为 `### ` 或更低。"
             )
+            if previous_summary:
+                batch_note += f"\n\n前面部分的章节结构摘要：\n{previous_summary}\n"
         batch_note += "\n\n"
 
         prompt = self.REORGANIZE_PROMPT.format(pages_content=batch_note + pages_content)
@@ -299,37 +322,36 @@ class ContentReorganizer:
         doc_title: str,
         config: ReorganizeConfig,
     ) -> str:
-        """分批次重构（适合长文档）- 并发执行"""
-        batches = self._split_balanced_batches(pages, config.max_pages_per_batch)
+        """分批次重构（适合长文档）- 串行执行，传递上下文"""
+        batches = self._split_balanced_batches(pages, config.max_pages_per_batch, config.max_chars_per_batch)
         batch_sizes = "/".join(str(len(batch)) for batch in batches)
 
-        print(f"  文档共{len(pages)}页，分{len(batches)}批重构（{batch_sizes}页），并发数: 3...")
+        print(f"  文档共{len(pages)}页，分{len(batches)}批重构（{batch_sizes}页），串行执行...")
 
-        # 并发处理各批
-        batch_results = [None] * len(batches)
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_idx = {}
-            for idx, batch in enumerate(batches):
-                future = executor.submit(
-                    self._reorganize_one_batch,
-                    idx, batch, doc_title, len(batches)
+        # 串行处理各批，传递上下文
+        batch_results = []
+        previous_summary = None
+
+        for idx, batch in enumerate(batches):
+            try:
+                _, result = self._reorganize_one_batch(
+                    idx, batch, doc_title, len(batches), previous_summary
                 )
-                future_to_idx[future] = idx
+                batch_results.append(result)
 
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    _, result = future.result()
-                    batch_results[idx] = result
-                except Exception as e:
-                    print(f"  ⚠️  第{idx + 1}批并发执行异常: {e}，降级为简单拼接")
-                    batch = batches[idx]
-                    fallback = self._simple_join(batch, doc_title)
-                    if idx > 0:
-                        lines = fallback.split('\n')
-                        if lines and lines[0].startswith('# '):
-                            fallback = '\n'.join(lines[1:]).strip()
-                    batch_results[idx] = fallback
+                # 提取当前批次的摘要，供下一批使用
+                if idx < len(batches) - 1:
+                    previous_summary = self._summarize_batch(result)
+
+            except Exception as e:
+                print(f"  ⚠️  第{idx + 1}批执行异常: {e}，降级为简单拼接")
+                fallback = self._simple_join(batch, doc_title)
+                if idx > 0:
+                    lines = fallback.split('\n')
+                    if lines and lines[0].startswith('# '):
+                        fallback = '\n'.join(lines[1:]).strip()
+                batch_results.append(fallback)
+                previous_summary = None
 
         # 合并所有批次结果
         final = '\n\n'.join(batch_results)
@@ -344,29 +366,35 @@ class ContentReorganizer:
     def _split_balanced_batches(
         pages: List[Tuple[int, str]],
         target_batch_size: int,
+        max_chars_per_batch: int = 350000,
     ) -> List[List[Tuple[int, str]]]:
         """
-        按目标页数均衡切分，允许单批小幅超出目标，避免 25/25/1 这类小尾批。
+        按目标页数和字符数均衡切分，避免单批超限。
         """
         total_pages = len(pages)
         if total_pages == 0:
             return []
 
-        target_batch_size = max(1, target_batch_size)
-        overflow_allowance = max(1, (target_batch_size + 9) // 10)
-        hard_batch_size = target_batch_size + overflow_allowance
-
-        batch_count = (total_pages + hard_batch_size - 1) // hard_batch_size
-        base_size = total_pages // batch_count
-        larger_batches = total_pages % batch_count
-
         batches = []
-        start = 0
-        for idx in range(batch_count):
-            size = base_size + (1 if idx < larger_batches else 0)
-            end = start + size
-            batches.append(pages[start:end])
-            start = end
+        current_batch = []
+        current_chars = 0
+
+        for page_num, content in pages:
+            content_chars = len(content)
+
+            # 如果当前batch不为空，且加入这页会超出字符限制，或页数已达上限
+            if (current_batch and
+                (len(current_batch) >= target_batch_size or
+                 current_chars + content_chars > max_chars_per_batch)):
+                batches.append(current_batch)
+                current_batch = [(page_num, content)]
+                current_chars = content_chars
+            else:
+                current_batch.append((page_num, content))
+                current_chars += content_chars
+
+        if current_batch:
+            batches.append(current_batch)
 
         return batches
 
