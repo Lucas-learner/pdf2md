@@ -229,7 +229,7 @@ class VisionRecognizer:
     def recognize_batch(
         self,
         image_paths: List[Path],
-        max_workers: int = 3,
+        max_workers: int = 10,
         progress_callback: Optional[callable] = None,
     ) -> List[RecognitionResult]:
         """

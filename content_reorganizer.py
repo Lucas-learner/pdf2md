@@ -303,11 +303,11 @@ class ContentReorganizer:
         batches = self._split_balanced_batches(pages, config.max_pages_per_batch)
         batch_sizes = "/".join(str(len(batch)) for batch in batches)
 
-        print(f"  文档共{len(pages)}页，分{len(batches)}批重构（{batch_sizes}页），并发数: 2...")
+        print(f"  文档共{len(pages)}页，分{len(batches)}批重构（{batch_sizes}页），并发数: 3...")
 
         # 并发处理各批
         batch_results = [None] * len(batches)
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             future_to_idx = {}
             for idx, batch in enumerate(batches):
                 future = executor.submit(

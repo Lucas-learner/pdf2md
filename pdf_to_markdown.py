@@ -94,9 +94,9 @@ def parse_args():
     parser.add_argument(
         "-c", "--concurrency",
         type=int,
-        default=3,
+        default=10,
         dest="concurrency",
-        help="并发数，默认3"
+        help="并发数，默认10"
     )
 
     parser.add_argument(
