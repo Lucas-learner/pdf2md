@@ -234,7 +234,7 @@ python pdf_to_markdown.py --help
   │              └── 否：进入智能重构
   │
   ▼
-[智能重构] ──→ 分块并发重构（max_workers=3，每批限流重试）
+[智能重构] ──→ 分块串行重构（结合字符数阈值判断，前一批摘要注入后一批）
   │             ├── 去除重复页眉页脚
   │             ├── 合并跨页段落
   │             ├── 构建章节层级
@@ -293,7 +293,7 @@ pdf-to-markdown/
 ├── document_detector.py      # 文档类型检测（扫描件/矢量/Word/PPTX）
 ├── pdf_converter.py          # PDF转图片 / PPTX转PDF
 ├── vision_recognizer.py      # Vision API识别（含错误分类、限流重试）
-├── content_reorganizer.py    # 智能重构（分块并发、限流保护）
+├── content_reorganizer.py    # 智能重构（分块串行、上下文传递、层级约束）
 ├── result_merger.py          # 结果合并（头部标注、重构/拼接路由）
 └── structured_extractors.py  # Word结构化提取
 ```
@@ -305,7 +305,8 @@ pdf-to-markdown/
 - **单页识别**：依赖Kimi Code Vision API，受API速率限制
 - **并发识别**：默认10并发，大文件可调低避免限流
 - **智能重构**：
-  - 长文档均衡分块并发重构（默认目标25页/批，并发workers=3；如51页会切为26/25）
+  - 长文档按页数+字符数双阈值分块串行重构（默认100页/批或35万字符/批，约180K tokens）
+  - 串行执行并传递前一批结构摘要，保证批次间章节层级一致
   - 需要额外LLM调用，增加Token消耗和耗时
 - **PPTX处理**：依赖LibreOffice，未安装时无法处理
 - **手写体**：识别准确率低于印刷体
